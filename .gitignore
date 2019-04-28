@@ -55,3 +55,8 @@ docs/_build/
 
 # PyBuilder
 target/
+
+*.json
+*.yaml
+*.ini
+*.key

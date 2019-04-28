@@ -7,7 +7,6 @@
 @license: MIT
 '''
 import os
-import re
 import sys
 import json
 import time
@@ -88,6 +87,10 @@ class OrderError(Exception):
     pass
 
 
+class ValidateError(Exception):
+    pass
+
+
 def httpget(url, data=None, err_msg='error'):
     logging.info('req: %s', url)
     try:
@@ -103,7 +106,7 @@ def httpget(url, data=None, err_msg='error'):
     try:
         respdata = json.loads(respdata)  # try to parse json results
         logging.debug('data:\n%s', pprint.pformat(respdata))
-    except ValueError:
+    except (ValueError, TypeError):
         pass  # ignore json parsing errors
     if code == 400 and respdata['type'] == 'urn:ietf:params:acme:error:badNonce':
         raise BadNonceError(url)
@@ -125,31 +128,58 @@ class Account(object):
         self.nonce = None
 
     def read_pem(self, pemfile, password=None):
+        try:
+            pkey = read_privatekey(pemfile, password)
+        except ValueError:
+            return
         logging.info('load account key from pemfile: %s', pemfile)
-        self.pkey = read_privatekey(pemfile, password)
-        assert isinstance(self.pkey, rsa.RSAPrivateKey)
-        pn = self.pkey.public_key().public_numbers()
-        self.jwk = {
-            'kty': 'RSA',
-            'n': int2b64(pn.n),
-            'e': int2b64(pn.e)}
-        logging.debug('jwk:\n%s', pprint.pformat(self.jwk))
+        if not isinstance(pkey, rsa.RSAPrivateKey):
+            raise ValueError('only support rsa key')
+        pn = pkey.public_key().public_numbers()
+        return pkey, {'kty': 'RSA', 'n': int2b64(pn.n), 'e': int2b64(pn.e)}
 
     def read_json(self, jsonfile):
-        logging.info('load account key from jsonfile: %s', jsonfile)
         with open(jsonfile, 'r') as fi:
-            jkey = json.loads(fi.read())
+            data = fi.read()
+        try:
+            jkey = json.loads(data)
+        except ValueError:
+            return
+        logging.info('load account key from jsonfile: %s', jsonfile)
+        return self.load_json(jkey)
+
+    def load_json(self, jkey):
         pubkey = rsa.RSAPublicNumbers(b642int(jkey['e']), b642int(jkey['n']))
         prikey = rsa.RSAPrivateNumbers(
             b642int(jkey['p']), b642int(jkey['q']), b642int(jkey['d']),
             b642int(jkey['dp']), b642int(jkey['dq']), b642int(jkey['qi']),
             pubkey)
-        self.pkey = prikey.private_key(BACKEND)
-        self.jwk = {k: jkey[k] for k in ['kty', 'n', 'e']}
+        pkey = prikey.private_key(BACKEND)
+        return pkey, {k: jkey[k] for k in ['kty', 'n', 'e']}
+
+    def load_key(self, key):
+        self.pkey, self.jwk = self.load_json(key)
+        logging.debug('jwk: %s', pprint.pformat(self.jwk))
+
+    def read_key(self, keyfile):
+        if not path.isfile(keyfile):
+            raise ValueError('%s not exist or not a file' % keyfile)
+        for f in [self.read_pem, self.read_json]:
+            r = f(keyfile)
+            if r:
+                self.pkey, self.jwk = r
+                break
+        else:
+            raise ValueError("can't identity key file format")
         logging.debug('jwk: %s', pprint.pformat(self.jwk))
 
     def sign(self, data):
         return self.pkey.sign(data, PADALGO, DGSTALGO)
+
+    def get_thumbprint(self):
+        accountkey_json = json.dumps(
+            self.jwk, sort_keys=True, separators=(',', ':'))
+        return _b64(hashlib.sha256(accountkey_json.encode('utf8')).digest())
 
     def get_nonce(self):  # CAUTION: not thread safe
         if self.nonce is None:
@@ -198,51 +228,32 @@ class Account(object):
             self.directory['newAccount'], reg_payload, 'register error')
         logging.info('registered!' if code == 201 else 'already registered!')
         self.kid = acct_headers['Location']
-        if self.contact is not None:
+        if self.contact:
             logging.info('update contact')
             account, _, _ = self.signed_get(
                 self.kid, {'contact': self.contact}, 'update contact error')
 
-    def get_thumbprint(self):
-        accountkey_json = json.dumps(
-            self.jwk, sort_keys=True, separators=(',', ':'))
-        return _b64(hashlib.sha256(accountkey_json.encode('utf8')).digest())
-
-    def make_order(self, od):
+    def make_order(self, domain, pem_prikey, password=None):
         logging.info('make order')
+        od = Order(self, domain, pem_prikey, password)
         payload = od.gen_order()
         od.order, _, od.headers = self.signed_get(
             self.directory['newOrder'], payload, 'make order error')
-
-    def finalize(self, od):
-        logging.debug('pem csr:\n' + od.gen_csr(Encoding.PEM).decode('utf-8'))
-        logging.warning('sign cert')
-        payload = {'csr': _b64(od.gen_csr())}
-        od.order, _, _= self.signed_get(
-            od.order['finalize'], payload, 'finalize order error')
-
-        od.order = self.wait(
-            od.headers['Location'], {'pending', 'processing'},
-            'check order status error')
-        if od.order['status'] != 'valid':
-            raise OrderError('order failed: %s' % order)
-        logging.warning('cert signed.')
-
-    def download_cert(self, od):
-        logging.info('download cert.')
-        pem, _, _ = httpget(od.order['certificate'],
-                            err_msg='certificate download failed')
-        return pem
+        return od
 
 
 class Order(object):
 
-    def __init__(self, domains, pem_prikey, password=None):
+    def __init__(self, acct, domains, pem_prikey, password=None):
+        self.acct = acct
         logging.info('domains: %s', domains)
         self.domains = domains
         logging.info('load domain key from pemfile: %s', pem_prikey)
         self.pkey = read_privatekey(pem_prikey, password)
-        self.order = None
+        self.order, self.header = None, None
+
+    def gen_order(self):
+        return {'identifiers': [{'type': 'dns', 'value': d} for d in self.domains]}
 
     def gen_csr(self, fmt=Encoding.DER):
         name = x509.Name([
@@ -256,108 +267,145 @@ class Order(object):
         csr = csr.sign(self.pkey, hashes.SHA256(), BACKEND)
         return csr.public_bytes(fmt)
 
-    def gen_order(self):
-        return {'identifiers': [{'type': 'dns', 'value': d} for d in self.domains]}
+    def finalize(self):
+        logging.debug('pem csr:\n' + self.gen_csr(Encoding.PEM).decode('utf-8'))
+        logging.warning('sign cert')
+        payload = {'csr': _b64(self.gen_csr())}
+        self.order, _, _= self.acct.signed_get(
+            self.order['finalize'], payload, 'finalize order error')
+        self.order = self.acct.wait(
+            self.headers['Location'], {'pending', 'processing'},
+            'check order status error')
+        if self.order['status'] != 'valid':
+            raise OrderError('order failed: %s' % order)
+        logging.warning('cert signed.')
+
+    def download_cert(self):
+        logging.info('download cert.')
+        pem, _, _ = httpget(self.order['certificate'],
+                            err_msg='certificate download failed')
+        return pem
+        
+
+def read_config_ini(configpath):
+    try:
+        import configparser
+        cp = configparser.ConfigParser()
+    except ImportError:
+        import ConfigParser as configparser
+        cp = configparser.SafeConfigParser()
+    try:
+        cp.read(configpath)
+    except configparser.MissingSectionHeaderError:
+        return
+    cfg = dict(cp['main'])
+    if 'domains' in cfg:
+        cfg['domain'] = cfg.pop('domains').split(',')
+    if 'contacts' in cfg:
+        cfg['contact'] = cfg.pop('contacts').split(',')
+    for n in cp.sections():
+        if n == 'main':
+            continue
+        v = dict(cp[n])
+        v['name'] = n
+        cfg.setdefault('validator', []).append(v)
+    return cfg
 
 
-class FileValidator(object):
-
-    re_token = re.compile(r'[^A-Za-z0-9_\-]')
-
-    def __init__(self, acme_path, disable_check):
-        self.acme_path = acme_path
-        self.disable_check = disable_check
-
-    def check(self, domain, wkpath, token, keyauth):
-        logging.info('check wellknown url')
-        try:
-            wkurl = 'http://{0}/.well-known/acme-challenge/{1}'.format(domain, token)
-            data, _, _ = httpget(wkurl)
-            if data != keyauth:
-                raise WellKnownCheckError()
-        except (AssertionError, ValueError) as e:
-            raise WellKnownCheckError(
-                "couldn't download wellknown file: {}".format(e))
-        logging.info('wellknown check passed')
-
-    def auth_domain(self, acct, auth_url):
-        logging.info('get challenge')
-        auth, _, _ = httpget(auth_url, err_msg='get challenges error')
-        domain = auth['identifier']['value']
-        logging.warning('verify %s', domain)
-
-        challenge = [c for c in auth['challenges'] if c['type'] == 'http-01'][0]
-        token = self.re_token.sub('_', challenge['token'])
-        keyauth = '%s.%s' %(token, acct.get_thumbprint())
-        wkpath = path.join(self.acme_path, token)
-        logging.info('write token to %s', wkpath)
-        with open(wkpath, 'w') as fo:
-            fo.write(keyauth)
-
-        try:
-            if not self.disable_check:
-                self.check(domain, wkpath, token, keyauth)
-
-            logging.info('submit challenge')
-            acct.signed_get(challenge['url'], {},
-                            'submit challenge error: %s' % domain)
-            auth = acct.wait(
-                auth_url, {'pending',},
-                'check challenge status error for %s' % domain)
-            if auth['status'] != 'valid':
-                raise ChallengeError(
-                    'challenge did not pass for {0}: {1}'.format(domain, auth))
-            logging.warning('%s verified!', domain)
-        finally:
-            logging.info('remove wellknown file %s', wkpath)
-            os.remove(wkpath)
-
-    def __call__(self, acct, od):
-        for auth_url in od.order['authorizations']:
-            self.auth_domain(acct, auth_url)
+def read_config_jsonyaml(configpath):
+    with open(configpath, 'rb') as fi:
+        data = fi.read()
+    try:
+        return json.loads(data)
+    except (ValueError, TypeError):
+        pass
+    try:
+        import yaml
+        return yaml.safe_load(data)
+    except ValueError:
+        pass
 
 
-def main():
+def read_config():
     parser = argparse.ArgumentParser()
     parser.add_argument('--account-key', '-a',
                         help='path to your account pem key')
-    parser.add_argument('--account-json', '-j',
-                        help='path to your account json key')
+    parser.add_argument('--config', '-c',
+                        help='path to config file')
     parser.add_argument('--domain', '-d', action='append',
                         help='domains')
-    parser.add_argument('--domain-key', '-k', required=True,
+    parser.add_argument('--domain-key', '-k',
                         help='path to your csr pem key')
-    parser.add_argument('--acme-path', '-p', required=True,
+    parser.add_argument('--acme-path', '-p',
                         help='path to the .well-known/acme-challenge/ directory')
-    parser.add_argument('--loglevel', '-l', default='WARNING',
+    parser.add_argument('--loglevel', '-l',
                         help='log level (e.g. DEBUG/INFO/WARNING/ERROR)')
-    parser.add_argument('--disable-check', default=False, action='store_true',
+    parser.add_argument('--logfile', '-f',
+                        help='log file')
+    parser.add_argument('--nocheck', default=False, action='store_true',
                         help='disable checking of the challenge file')
-    parser.add_argument('--directory-url', '-u', default=DEFAULT_DIRECTORY_URL,
+    parser.add_argument('--directory-url', '-u',
                         help='certificate authority directory url')
-    parser.add_argument('--contact', metavar="CONTACT", default=None, nargs="*",
-                        help='contact details (e.g. mailto:aaa@bbb.com) for your account-key')
-
+    parser.add_argument('--contact', action='append',
+                        help='contact details (e.g. mailto:aaa@bbb.com)')
     args = parser.parse_args()
-    logging.basicConfig(level=args.loglevel)
 
-    acct = Account(args.directory_url, args.contact)
-    od = Order(args.domain, args.domain_key)
-    validator = FileValidator(args.acme_path, args.disable_check)
-
-    if args.account_key:
-        acct.read_pem(args.account_key)
-    elif args.account_json:
-        acct.read_json(args.account_json)
+    if args.config:
+        cfg = read_config_ini(args.config)
+        if not cfg:
+            cfg = read_config_jsonyaml(args.config)
     else:
-        logging.error('no pem or json file of account')
-        return
+        cfg = {}
+
+    for n in ['account_key', 'domain', 'domain_key',
+              'loglevel', 'logfile', 'directory_url']:
+        if getattr(args, n):
+            cfg[n.replace('_', '-')] = getattr(args, n)
+    if args.acme_path:
+        v = {
+            'name': 'file',
+            'path': args.acme_path,
+            'nocheck': args.nocheck}
+        cfg.setdefault('validator', []).append(v)
+
+    cfg.setdefault('loglevel', 'WARNING')
+    cfg.setdefault('directory-url', DEFAULT_DIRECTORY_URL)
+
+    for n in ['account-key', 'domain', 'domain-key', 'validator']:
+        if not cfg.get(n):
+            raise ValueError('no %s' % n)
+    return cfg
+
+
+def main():
+    cfg = read_config()
+
+    logging.basicConfig(level=cfg['loglevel'], filename=cfg.get('logfile', None))
+    logging.debug('config:\n%s', pprint.pformat(cfg))
+
+    acct = Account(cfg['directory-url'], cfg['contact'])
+    if isinstance(cfg['account-key'], str):
+        acct.read_key(cfg['account-key'])
+    else:
+        acct.load_key(cfg['account-key'])
+    
+    validators = []
+    for v in cfg['validator']:
+        mod = __import__(v.pop('name'))
+        validators.append(mod.Validator(**v))
+
     acct.register()
-    acct.make_order(od)
-    validator(acct, od)
-    acct.finalize(od)
-    pem = acct.download_cert(od)
-    sys.stdout.write(pem)
+    od = acct.make_order(cfg['domain'], cfg['domain-key'])
+    for validator in validators:
+        try:
+            validator(od)
+            break
+        except Exception as e:
+            logging.error(e)
+    else:
+        raise ValidateError('no validator works')
+    od.finalize()
+    sys.stdout.write(od.download_cert())
 
 
 if __name__ == '__main__':
